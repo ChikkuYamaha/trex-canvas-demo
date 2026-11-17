@@ -1,0 +1,41 @@
+name: Game Preview Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 270
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg xvfb chromium-browser
+
+      - name: Run display test
+        env:
+          STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
+        run: |
+          sed -i 's/rotated = vh > vw;/rotated = false;/g' "dino-autopilot-v2.html"
+
+          python3 -m http.server 8000 &
+          sleep 2
+
+          Xvfb :99 -screen 0 720x1280x24 &
+          export DISPLAY=:99
+
+          chromium-browser --no-sandbox --disable-dev-shm-usage --window-size=720,1280 --window-position=0,0 --kiosk --autoplay-policy=no-user-gesture-required "http://localhost:8000/dino-autopilot-v2.html" &
+          sleep 6
+
+          RAND_MINS=$((235 + RANDOM % 21))
+          echo "Running preview for $RAND_MINS minutes"
+
+          timeout "${RAND_MINS}m" ffmpeg -f x11grab -draw_mouse 0 -video_size 720x1280 -framerate 30 -i :99 \
+            -stream_loop -1 -i "music.mp3" \
+            -c:v libx264 -preset ultrafast -b:v 2500k -minrate 2500k -maxrate 3000k -bufsize 5000k -nal-hrd cbr -pix_fmt yuv420p -g 60 \
+            -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -f flv "rtmp://a.rtmp.youtube.com/live2/$STREAM_KEY" || true
+            
