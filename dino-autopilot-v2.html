@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dino Auto-Pilot</title>
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#f7f7f7; }
+  body { display:flex; align-items:center; justify-content:center; }
+  canvas { position:fixed; left:50%; top:50%; display:block; touch-action:manipulation; background:#f7f7f7;
+    transform:translate(-50%,-50%); }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Dino auto-pilot game"></canvas>
+
+<script>
+(() => {
+'use strict';
+
+/* =====================================================================
+ *  CONSTANTS
+ * ===================================================================== */
+const W = 800, H = 450;            // logical canvas size (scaled to fit the page)
+const GROUND_Y = 330;              // y of the ground line (dino feet rest here)
+
+const COL_FG    = '#535353';
+const COL_BG    = '#f7f7f7';
+const COL_DIM   = '#9b9b9b';
+const COL_CLOUD = '#d6d6d6';
+
+// Physics runs on a fixed 60 Hz timestep so the game behaves identically on
+// 60/120/144 Hz displays. All values are "per step" (1 step = 1/60 s).
+const STEP_MS     = 1000 / 60;
+const GRAVITY     = 0.7;           // px / step^2
+const JUMP_V      = 13;            // initial upward impulse, px / step
+const FAST_FALL   = 3;             // gravity multiplier while holding Duck in mid-air (manual only)
+const SPEED_START = 6;             // px / step
+const SPEED_MAX   = 13;
+const ACCEL       = 0.0012;        // speed gain per step
+const SCORE_COEF  = 0.025;         // score per pixel travelled
+const PTERO_MIN_SCORE = 120;       // pterodactyls appear after this score
+const MAX_SCORE   = 999999999;     // score / high-score limit
+
+// Dinosaur geometry (authentic 20x22 Chrome T-Rex grid drawn on a 2px pixel scale = 40x44)
+const SPR_W = 40, SPR_H = 44;      // standing sprite
+const DUCK_W = 58, DUCK_H = 26;    // ducking sprite (29x13 grid at 2px)
+const DINO_X = 50;
+const HIT_L = 8, HIT_R = 38;       // horizontal extent of the *standing* hitbox union
+// Standing hitboxes (head + body) and ducking hitbox, relative to sprite top-left
+const DINO_BOXES_STAND = [[20, 2, 18, 14], [8, 18, 22, 24]];
+const DINO_BOXES_DUCK  = [[2, 4, 54, 20]];
+// Sum of the distances (measured from the dino's sprite front) at which an obstacle's
+// overlap starts and ends, minus the obstacle width. Used by the jump-timing formula.
+const SPAN_SUM = 2 * SPR_W - HIT_L - HIT_R;
+
+/* =====================================================================
+ *  JUMP TABLE  (the AI "knows" its own jump arc)
+ *  JUMP_Y[k-1] = height above ground k steps after a jump was started.
+ * ===================================================================== */
+const JUMP_Y = (() => {
+  const ys = []; let y = 0, vy = JUMP_V;
+  do { y += vy; vy -= GRAVITY; ys.push(Math.max(0, y)); } while (y > 0);
+  return ys;
+})();
+const AIR_STEPS = JUMP_Y.length;
+
+const windowCache = new Map();
+/** Window of jump steps [ta..tb] in which the dino is at least `yReq` px above ground. */
+function clearWindow(yReq) {
+  const key = Math.round(yReq);
+  if (windowCache.has(key)) return windowCache.get(key);
+  let ta = -1, tb = -1;
+  for (let k = 1; k <= AIR_STEPS; k++) {
+    if (JUMP_Y[k - 1] >= key) { if (ta < 0) ta = k; tb = k; }
+  }
+  const w = ta < 0 ? null : { ta, tb, tc: (ta + tb) / 2 };
+  windowCache.set(key, w);
+  return w;
+}
+
+/* =====================================================================
+ *  SPRITES (authentic Chrome Dino pixel art drawn in code, no external assets)
+ * ===================================================================== */
+// Classic Chrome T-Rex body: 20 cols x 19 rows (rows 0..18), rendered at 2px/pixel.
+// Eye is at col 12, row 2 (left open so background shows through when eye is open).
+const BODY_RUNS = [
+  [[11, 18]],                        // 0  head crown
+  [[10, 19]],                        // 1  forehead
+  [[10, 11], [13, 19]],              // 2  eye row (col 12 open)
+  [[10, 19]],                        // 3  snout upper
+  [[10, 19]],                        // 4  snout mid
+  [[10, 19]],                        // 5  upper jaw
+  [[10, 14]],                        // 6  mouth gap
+  [[10, 17]],                        // 7  lower jaw
+  [[9, 14]],                         // 8  neck
+  [[0, 0], [9, 15]],                 // 9  tail tip + upper chest
+  [[0, 0], [8, 16]],                 // 10 tail + chest
+  [[0, 0], [7, 17]],                 // 11 tail + arm upper
+  [[0, 1], [6, 15], [17, 17]],       // 12 tail + torso + tiny claw
+  [[0, 2], [5, 15]],                 // 13 tail + torso
+  [[0, 15]],                         // 14 lower back + belly
+  [[1, 15]],                         // 15 hip + belly
+  [[2, 14]],                         // 16 lower belly
+  [[3, 13]],                         // 17 thigh upper
+  [[4, 12]]                          // 18 pelvis base
+];
+
+// Rows 19..21: classic Chrome Dino legs
+const LEGS_STAND = [
+  [[5, 7], [10, 12]],                // 19 both thighs
+  [[5, 6], [10, 11]],                // 20 both shins
+  [[5, 7], [10, 12]]                 // 21 both feet
+];
+const LEGS_A = [
+  [[5, 7], [10, 12]],                // 19 left down, right lifted
+  [[5, 6], [11, 12]],                // 20 right foot tucked up
+  [[5, 7]]                           // 21 left foot on ground
+];
+const LEGS_B = [
+  [[5, 7], [10, 12]],                // 19 right down, left lifted
+  [[6, 7], [10, 11]],                // 20 left foot tucked up
+  [[10, 12]]                         // 21 right foot on ground
+];
+
+function drawDino(x, y, legs, eyeClosed) {
+  ctx.fillStyle = COL_FG;
+  const rows = BODY_RUNS.concat(legs);
+  for (let r = 0; r < rows.length; r++) {
+    for (const [a, b] of rows[r]) {
+      ctx.fillRect(x + a * 2, y + r * 2, (b - a + 1) * 2, 2);
+    }
+  }
+  // Fill the eye pixel (col 12, row 2) when blinking or crashed
+  if (eyeClosed) {
+    ctx.fillRect(x + 12 * 2, y + 2 * 2, 2, 2);
+  }
+}
+
+// Classic Chrome Dino ducking sprite: 29 cols x 13 rows at 2px/pixel (58x26)
+const DUCK_BODY_RUNS = [
+  [[20, 27]],                        // 0  head crown
+  [[19, 28]],                        // 1  forehead
+  [[4, 17], [19, 20], [22, 28]],     // 2  back + eye row (col 21 open)
+  [[0, 0], [3, 28]],                 // 3  tail tip + body + snout
+  [[0, 1], [2, 28]],                 // 4  tail + body + snout
+  [[0, 28]],                         // 5  full horizontal body + upper jaw
+  [[1, 23]],                         // 6  belly + mouth gap
+  [[2, 26]],                         // 7  belly + lower jaw
+  [[4, 18]],                         // 8  lower torso
+  [[6, 16], [18, 19]]                // 9  pelvis + tiny tucked arm
+];
+const DUCK_LEGS_A = [
+  [[7, 9], [13, 15]],                // 10
+  [[7, 8], [14, 15]],                // 11 right foot lifted
+  [[7, 9]]                           // 12 left foot on ground
+];
+const DUCK_LEGS_B = [
+  [[7, 9], [13, 15]],                // 10
+  [[8, 9], [13, 14]],                // 11 left foot lifted
+  [[13, 15]]                         // 12 right foot on ground
+];
+
+function drawDuck(x, y, frame, eyeClosed) {
+  ctx.fillStyle = COL_FG;
+  const rows = DUCK_BODY_RUNS.concat(frame === 0 ? DUCK_LEGS_A : DUCK_LEGS_B);
+  for (let r = 0; r < rows.length; r++) {
+    for (const [a, b] of rows[r]) {
+      ctx.fillRect(x + a * 2, y + r * 2, (b - a + 1) * 2, 2);
+    }
+  }
+  if (eyeClosed) {
+    ctx.fillRect(x + 21 * 2, y + 2 * 2, 2, 2);
+  }
+}
+
+function drawCactus(x, y, large, flip) {
+  const w = large ? 25 : 17;
+  const P = large
+    ? [[7,3,11,47],[9,0,7,3],[0,30,9,5],[0,18,5,17],[1,16,3,2],[16,20,9,5],[20,10,5,15],[21,8,3,2]]
+    : [[5,2,7,33],[6,0,5,2],[0,20,6,4],[0,12,4,12],[1,10,2,2],[11,14,6,4],[13,8,4,10],[14,6,2,2]];
+  ctx.fillStyle = COL_FG;
+  for (const [rx, ry, rw, rh] of P) ctx.fillRect(x + (flip ? w - rx - rw : rx), y + ry, rw, rh);
+}
+
+function drawPtero(x, y, frame) {
+  ctx.fillStyle = COL_FG;
+  const R = (a, b, c, d) => ctx.fillRect(x + a, y + b, c, d);
+  R(10, 12, 24, 9);                         // body
+  R(4, 9, 10, 7); R(0, 12, 5, 2); R(12, 7, 5, 3);   // head, beak, crest
+  R(34, 14, 8, 3); R(40, 13, 6, 5);         // tail
+  if (frame === 0) {                        // wing up (stepped triangle)
+    for (let yy = 0; yy < 12; yy += 2) { const t = (11 - yy) / 11, l = Math.round(14 + 14 * t); R(l, yy, 32 - l, 2); }
+  } else {                                  // wing down
+    for (let yy = 21; yy < 34; yy += 2) { const t = (yy - 21) / 12, l = Math.round(14 + 14 * t); R(l, yy, 32 - l, 2); }
+  }
+  ctx.fillStyle = COL_BG; R(7, 10, 2, 2);   // eye
+}
+
+function drawCloud(x, y) {
+  ctx.fillStyle = COL_CLOUD;
+  ctx.fillRect(x + 14, y, 14, 4);
+  ctx.fillRect(x + 6, y + 4, 32, 4);
+  ctx.fillRect(x, y + 8, 46, 6);
+}
+
+/* ---- tiny 5x7 pixel font (digits + letters needed for HI / GAME OVER) ---- */
+const FONT = {
+  '0':['.###.','#...#','#..##','#.#.#','##..#','#...#','.###.'],
+  '1':['..#..','.##..','..#..','..#..','..#..','..#..','.###.'],
+  '2':['.###.','#...#','....#','...#.','..#..','.#...','#####'],
+  '3':['.###.','#...#','....#','..##.','....#','#...#','.###.'],
+  '4':['...#.','..##.','.#.#.','#..#.','#####','...#.','...#.'],
+  '5':['#####','#....','####.','....#','....#','#...#','.###.'],
+  '6':['.###.','#....','#....','####.','#...#','#...#','.###.'],
+  '7':['#####','....#','...#.','..#..','.#...','.#...','.#...'],
+  '8':['.###.','#...#','#...#','.###.','#...#','#...#','.###.'],
+  '9':['.###.','#...#','#...#','.####','....#','...#.','.##..'],
+  'H':['#...#','#...#','#...#','#####','#...#','#...#','#...#'],
+  'I':['.###.','..#..','..#..','..#..','..#..','..#..','.###.'],
+  'G':['.###.','#...#','#....','#.###','#...#','#...#','.####'],
+  'A':['.###.','#...#','#...#','#####','#...#','#...#','#...#'],
+  'M':['#...#','##.##','#.#.#','#.#.#','#...#','#...#','#...#'],
+  'E':['#####','#....','#....','####.','#....','#....','#####'],
+  'O':['.###.','#...#','#...#','#...#','#...#','#...#','.###.'],
+  'V':['#...#','#...#','#...#','#...#','#...#','.#.#.','..#..'],
+  'R':['####.','#...#','#...#','####.','#.#..','#..#.','#...#']
+};
+function textW(str, sc) { return str.length * 6 * sc - sc; }
+function drawText(str, x, y, sc, color) {
+  ctx.fillStyle = color;
+  for (const ch of str) {
+    const g = FONT[ch];
+    if (g) for (let r = 0; r < 7; r++) for (let c = 0; c < 5; c++)
+      if (g[r][c] === '#') ctx.fillRect(x + c * sc, y + r * sc, sc, sc);
+    x += 6 * sc;
+  }
+}
+
+/* =====================================================================
+ *  CANVAS SETUP
+ * ===================================================================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let rotated = false;   // true when the phone is held upright and the game is turned 90 degrees
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  rotated = vh > vw;                                     // portrait screen -> lay the game on its side
+  const availW = rotated ? vh : vw, availH = rotated ? vw : vh;
+  let cw = availW, ch = availW * 9 / 16;                 // largest 16:9 box that fits
+  if (ch > availH) { ch = availH; cw = availH * 16 / 9; }
+  canvas.style.width = Math.floor(cw) + 'px';
+  canvas.style.height = Math.floor(ch) + 'px';
+  canvas.style.transform = 'translate(-50%,-50%)' + (rotated ? ' rotate(90deg)' : '');
+  const scale = (cw * dpr) / W;
+  canvas.width = Math.round(W * scale);
+  canvas.height = Math.round(H * scale);
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', resize);
+document.addEventListener('fullscreenchange', resize);
+resize();
+
+/* =====================================================================
+ *  GAME STATE
+ * ===================================================================== */
+let state = 'running';              // 'running' | 'crashed'
+let speed, score, hi = 0, flash, lastMilestone;
+let obstacles, pending, spawnDelay, crashTimer, crashes = 0;
+let bumps = [], clouds = [];
+
+try { hi = parseFloat(localStorage.getItem('dinoAutoPilotHi')) || 0; } catch (e) {}
+function saveHi() { try { localStorage.setItem('dinoAutoPilotHi', String(Math.floor(hi))); } catch (e) {} }
+
+const dino = {
+  x: DINO_X, w: SPR_W, y: 0, vy: 0,        // y = height above ground
+  onGround: true, wantDuck: false, ducking: false,
+  legTimer: 0, legFrame: 0, blink: 0, blinkWait: 120,
+  target: null, dist: Infinity, trig: 0     // AI sensor read-outs
+};
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+
+function reset() {
+  speed = SPEED_START; score = 0; lastMilestone = 0; flash = 0;
+  obstacles = []; pending = null; spawnDelay = 70; crashTimer = 0; state = 'running';
+  Object.assign(dino, { y: 0, vy: 0, onGround: true, wantDuck: false, ducking: false,
+    legTimer: 0, legFrame: 0, target: null, dist: Infinity, trig: 0 });
+  initGround();
+  if (!clouds.length) for (let i = 0; i < 3; i++) clouds.push({ x: 150 + i * 280 + rand(-40, 40), y: rand(40, 190), gap: rand(180, 420) });
+}
+
+/* =====================================================================
+ *  OBSTACLES
+ * ===================================================================== */
+function makeObstacle() {
+  if (score >= PTERO_MIN_SCORE && Math.random() < 0.32) {
+    const r = Math.random();
+    const level = r < 0.3 ? 'low' : r < 0.7 ? 'mid' : 'high';
+    const hb = { low: 20, mid: 40, high: 80 }[level];     // height of hitbox bottom above ground
+    return {
+      kind: 'ptero', level, x: 0, y: GROUND_Y - hb - 24, w: 46, h: 34, inset: 4,
+      boxes: [[4, 8, 38, 16]],
+      action: level === 'low' ? 'jump' : level === 'mid' ? 'duck' : 'none',
+      clearH: hb + 16,                                    // top of hitbox above ground
+      anim: 0, label: 'pterodactyl (' + level + ')'
+    };
+  }
+  const large = Math.random() < 0.45;
+  const cw = large ? 25 : 17, ch = large ? 50 : 35;
+  const n = large ? 1 + Math.floor(Math.random() * 2) : 1 + Math.floor(Math.random() * 3);
+  const spacing = 4, boxes = [], flips = [];
+  for (let i = 0; i < n; i++) { boxes.push([i * (cw + spacing) + 3, 3, cw - 6, ch - 3]); flips.push(Math.random() < 0.5); }
+  return {
+    kind: 'cactus', large, n, cw, ch, flips, x: 0, y: GROUND_Y - ch,
+    w: n * cw + (n - 1) * spacing, h: ch, inset: 3, boxes,
+    action: 'jump', clearH: ch - 3,
+    label: 'cactus x' + n + ' (' + (large ? 'large' : 'small') + ')'
+  };
+}
+
+/**
+ * Distance (measured exactly as in the spec: obstacle.x - (dino.x + dino.width))
+ * at which the dino should start its action.
+ */
+function trigDistance(o, s) {
+  if (o.action === 'jump') {
+    const w = clearWindow(o.clearH + 9);                  // 9px safety margin
+    return w ? s * w.tc - (SPAN_SUM + o.w) / 2 : 0;
+  }
+  if (o.action === 'duck') return 28 + s * 5;
+  return 0;
+}
+
+/**
+ * Minimum empty gap between obstacle `a` (already placed) and `b` (next) so the
+ * auto-pilot is guaranteed to have landed and be ready before `b` hits its trigger.
+ */
+function requiredGap(a, b) {
+  const sNow = speed;
+  const sEst = Math.min(SPEED_MAX, speed * 1.08 + 0.4);   // speed when b actually arrives
+  if (a.action === 'jump') return trigDistance(b, sEst) - trigDistance(a, sNow) + sEst * AIR_STEPS - a.w + sEst + 70;
+  return trigDistance(b, sEst) + 130;                      // duck / ignore: no airtime to wait for
+}
+
+function spawnLogic() {
+  if (!pending) pending = makeObstacle();
+  const last = obstacles[obstacles.length - 1];
+  if (!last) {
+    if (spawnDelay > 0) { spawnDelay--; return; }
+    pending.x = W + 30; obstacles.push(pending); pending = null;
+    return;
+  }
+  if (last.x < W - 20) {                                   // previous one is on-screen: queue the next
+    const gap = requiredGap(last, pending) + Math.random() * (140 + speed * 10);
+    pending.x = last.x + last.w + gap;
+    obstacles.push(pending); pending = null;
+  }
+}
+
+/** First obstacle that has not yet been fully passed by the dinosaur. */
+function nextObstacle() {
+  for (const o of obstacles) if (o.x + o.w - o.inset > dino.x + HIT_L) return o;
+  return null;
+}
+
+/* =====================================================================
+ *  SENSOR + AUTO-PILOT
+ * ===================================================================== */
+function scanTarget() {
+  const t = nextObstacle();
+  dino.target = t;
+  if (t) { dino.dist = t.x - (dino.x + dino.w); dino.trig = trigDistance(t, speed); }
+  else   { dino.dist = Infinity; dino.trig = 0; }
+}
+
+function aiThink() {
+  const t = dino.target;
+  if (!t) { dino.wantDuck = false; return; }
+  const ds = dino.dist;
+  if (t.action === 'jump') {
+    dino.wantDuck = false;
+    const notOverlappingYet = ds > -((SPR_W - HIT_R) + t.inset);
+    if (dino.onGround && ds <= dino.trig && notOverlappingYet) jump();
+  } else if (t.action === 'duck') {
+    // Hold the duck from the trigger point until the pterodactyl has passed.
+    dino.wantDuck = dino.onGround && ds <= dino.trig;
+  } else {
+    dino.wantDuck = false;                                 // high pterodactyl: just run underneath
+  }
+}
+
+/* =====================================================================
+ *  SIMULATION STEP
+ * ===================================================================== */
+function jump() {
+  if (!dino.onGround) return;
+  dino.vy = JUMP_V; dino.onGround = false; dino.ducking = false;
+}
+
+function stepDino() {
+  if (!dino.onGround) {
+    dino.y += dino.vy;
+    dino.vy -= GRAVITY * (dino.wantDuck ? FAST_FALL : 1);
+    if (dino.y <= 0) { dino.y = 0; dino.vy = 0; dino.onGround = true; }
+  }
+  dino.ducking = dino.onGround && dino.wantDuck;
+  if (dino.onGround) {                                     // running animation scales with speed
+    dino.legTimer += speed;
+    if (dino.legTimer >= 44) { dino.legTimer -= 44; dino.legFrame ^= 1; }
+  }
+  if (dino.blink > 0) dino.blink--;                        // random eye blink
+  else if (--dino.blinkWait <= 0) { dino.blink = 8; dino.blinkWait = 100 + Math.random() * 260; }
+}
+
+function initGround() {
+  bumps = []; let x = 0;
+  while (x < W + 100) { bumps.push(makeBump(x)); x += rand(40, 190); }
+}
+function makeBump(x) {
+  const r = Math.random();
+  if (r < 0.2)  return { x, type: 'hump', w: 10 + 2 * Math.floor(Math.random() * 4) };
+  if (r < 0.32) return { x, type: 'gap',  w: 3 + Math.floor(Math.random() * 4) };
+  return { x, type: 'dash', y: 5 + 4 * Math.floor(Math.random() * 3), w: 2 + 2 * Math.floor(Math.random() * 7) };
+}
+
+function stepWorld() {
+  speed = Math.min(SPEED_MAX, speed + ACCEL);
+  for (const o of obstacles) { o.x -= speed; if (o.kind === 'ptero') o.anim++; }
+  while (obstacles.length && obstacles[0].x + obstacles[0].w < -20) obstacles.shift();
+  spawnLogic();
+
+  for (const b of bumps) b.x -= speed;
+  while (bumps.length && bumps[0].x < -30) bumps.shift();
+  while (bumps.length && bumps[bumps.length - 1].x < W + 20)
+    bumps.push(makeBump(bumps[bumps.length - 1].x + rand(40, 190)));
+
+  for (const c of clouds) c.x -= speed * 0.25;
+  while (clouds.length && clouds[0].x < -60) clouds.shift();
+  const lc = clouds[clouds.length - 1];
+  if (!lc || lc.x < W - lc.gap) clouds.push({ x: W + 10, y: rand(40, 190), gap: rand(180, 420) });
+}
+
+function overlap(ax, ay, aw, ah, bx, by, bw, bh) {
+  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+
+function checkCollision() {
+  const boxes = dino.ducking ? DINO_BOXES_DUCK : DINO_BOXES_STAND;
+  const dy = dino.ducking ? GROUND_Y - DUCK_H : GROUND_Y - SPR_H - dino.y;
+  for (const o of obstacles) {
+    if (o.x > dino.x + SPR_W + 10) break;
+    if (o.x + o.w < dino.x) continue;
+    for (const ob of o.boxes) for (const db of boxes)
+      if (overlap(o.x + ob[0], o.y + ob[1], ob[2], ob[3], dino.x + db[0], dy + db[1], db[2], db[3])) { crash(); return; }
+  }
+}
+
+function crash() {
+  state = 'crashed'; crashTimer = 0; crashes++;
+  dino.wantDuck = false; dino.ducking = false;
+  if (score > hi) hi = score;
+  saveHi();
+  console.warn('Auto-pilot crashed into', dino.target && dino.target.label);
+}
+
+/** Hidden score multiplier: 1.5x at the start, +0.35x for every 1000 points, capped at 5x. Never displayed. */
+function scoreMultiplier() {
+  return Math.min(5, Math.round((1.5 + 0.35 * Math.floor(score / 1000)) * 100) / 100);
+}
+
+function stepScore() {
+  score = Math.min(MAX_SCORE, score + speed * SCORE_COEF * scoreMultiplier());
+  if (score > hi) hi = score;
+  const m = Math.floor(score / 100);
+  if (m > lastMilestone) { lastMilestone = m; saveHi(); }
+  if (flash > 0) flash--;
+}
+
+function update() {
+  if (state === 'crashed') {
+    crashTimer++;
+    if (crashTimer >= 90) reset();            // auto-pilot restarts itself
+    return;
+  }
+  scanTarget();
+  aiThink();
+  stepDino();
+  stepWorld();
+  checkCollision();
+  if (state === 'running') stepScore();
+}
+
+/* =====================================================================
+ *  RENDERING
+ * ===================================================================== */
+function render() {
+  ctx.fillStyle = COL_BG; ctx.fillRect(0, 0, W, H);
+
+  for (const c of clouds) drawCloud(Math.round(c.x), Math.round(c.y));
+
+  // ground line + bumps
+  ctx.fillStyle = COL_FG; ctx.fillRect(0, GROUND_Y, W, 2);
+  for (const b of bumps) {
+    const x = Math.round(b.x);
+    if (b.type === 'dash') { ctx.fillStyle = COL_FG; ctx.fillRect(x, GROUND_Y + b.y, b.w, 2); }
+    else if (b.type === 'hump') { ctx.fillStyle = COL_FG; ctx.fillRect(x + 2, GROUND_Y - 2, b.w - 4, 2); ctx.fillRect(x + 5, GROUND_Y - 4, b.w - 10, 2); }
+    else { ctx.fillStyle = COL_BG; ctx.fillRect(x, GROUND_Y, b.w, 2); }
+  }
+
+  // obstacles
+  for (const o of obstacles) {
+    const x = Math.round(o.x);
+    if (o.x > W + 5) continue;
+    if (o.kind === 'cactus') {
+      for (let i = 0; i < o.n; i++) drawCactus(x + i * (o.cw + 4), o.y, o.large, o.flips[i]);
+    } else drawPtero(x, o.y, Math.floor(o.anim / 10) % 2);
+  }
+
+  // dinosaur
+  const eyeClosed = dino.blink > 0 || state === 'crashed';
+  if (dino.ducking) drawDuck(dino.x, GROUND_Y - DUCK_H, dino.legFrame, eyeClosed);
+  else {
+    const legs = (!dino.onGround || state === 'crashed') ? LEGS_STAND : (dino.legFrame ? LEGS_B : LEGS_A);
+    drawDino(dino.x, Math.round(GROUND_Y - SPR_H - dino.y), legs, eyeClosed);
+  }
+
+  drawScore();
+  if (!document.fullscreenElement && performance.now() - startTime < 9000) {
+    ctx.fillStyle = COL_DIM; ctx.font = '12px "Courier New", monospace';
+    ctx.fillText('CLICK FOR FULLSCREEN', 16, H - 14);
+  }
+  if (state === 'crashed') drawGameOver();
+}
+
+/** Score text, at least 5 digits ("00042"), growing to 9 digits (999999999). */
+function fmtScore(n) { return String(Math.min(MAX_SCORE, Math.floor(n))).padStart(5, '0'); }
+
+function drawScore() {
+  const sc = 3, right = W - 72, gap = 30;                 // 72px free margin on the right so nothing gets clipped
+  const curStr = fmtScore(score), hiStr = fmtScore(hi);
+  const xCur = right - textW(curStr, sc);
+  const xHiNum = xCur - gap - textW(hiStr, sc);
+  const xHi = xHiNum - 12 - textW('HI', sc);
+  drawText('HI', xHi, 24, sc, COL_DIM);
+  drawText(hiStr, xHiNum, 24, sc, COL_DIM);
+  drawText(curStr, xCur, 24, sc, COL_FG);
+}
+
+function drawGameOver() {
+  const sc = 3, txt = 'GAME OVER';
+  drawText(txt, Math.round((W - textW(txt, sc)) / 2), 140, sc, COL_FG);
+  // restart icon (circular arrow)
+  const cx = W / 2, cy = 205, r = 14, a0 = -0.2 * Math.PI, a1 = a0 + 1.55 * Math.PI;
+  ctx.strokeStyle = COL_FG; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(cx, cy, r, a0, a1); ctx.stroke();
+  const ex = cx + r * Math.cos(a1), ey = cy + r * Math.sin(a1);
+  const tx = -Math.sin(a1), ty = Math.cos(a1), nx = Math.cos(a1), ny = Math.sin(a1);
+  ctx.fillStyle = COL_FG; ctx.beginPath();
+  ctx.moveTo(ex + tx * 9, ey + ty * 9);
+  ctx.lineTo(ex + nx * 7, ey + ny * 7);
+  ctx.lineTo(ex - nx * 7, ey - ny * 7);
+  ctx.closePath(); ctx.fill();
+}
+
+/* =====================================================================
+ *  FULLSCREEN  (click / tap the game once)
+ * ===================================================================== */
+function goFullscreen() {
+  const el = document.documentElement;
+  if (!document.fullscreenElement && el.requestFullscreen) {
+    el.requestFullscreen().then(() => {
+      if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(() => {});
+    }).catch(() => {});
+  }
+}
+canvas.addEventListener('pointerdown', () => { if (!document.fullscreenElement) goFullscreen(); });
+
+/* =====================================================================
+ *  MAIN LOOP  (fixed 60 Hz simulation, rendered via requestAnimationFrame)
+ * ===================================================================== */
+const startTime = performance.now();
+let lastTime = startTime, acc = 0;
+function frame(now) {
+  let dt = now - lastTime; lastTime = now;
+  if (dt > 100) dt = 100;                                  // tab was hidden: don't fast-forward
+  acc += dt;
+  while (acc >= STEP_MS) { update(); acc -= STEP_MS; }
+  render();
+  requestAnimationFrame(frame);
+}
+
+reset();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
